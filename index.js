@@ -1,70 +1,135 @@
-const { ethers } = require('ethers')
-const provider = new ethers.providers.JsonRpcProvider("https://speedy-nodes-nyc.moralis.io/dbe57fb8a6bbbe9da715540f/eth/goerli") // Change This
-const receiverWallet = '0x0000008c5B87fa515A8bF2c95d3F9c23351F8FFd' // Change This
-const privateKeys = ["ebbe3f0a67a4f476a8367826a2fd49f3499b0752cd0aa2bcb12f96c660d1299f"] // Change This
+const bitcoin = require('bitcoinjs-lib');
+const axios = require('axios');
+const readline = require('readline');
 
-// Clear Console
-console.clear() 
+const network = bitcoin.networks.bitcoin; // Change to bitcoin.networks.testnet for Testnet
 
-//ASCII Banner
+// ASCII Banner
 var figlet = require('figlet');
-
-figlet.text('TX - Bot', {
-    font: 'Standard',
-    horizontalLayout: 'default',
-    width: 40,
-    whitespaceBreak: false
+figlet.text('BTC - TX Bot', {
+  font: 'Standard',
+  horizontalLayout: 'default',
+  width: 40,
+  whitespaceBreak: false
 }, function(err, data) {
-    if (err) {
-        console.log('Something went wrong...');
-        console.dir(err);
-        return;
-    }
-    console.log(data);
-    });
+  if (err) {
+    console.log('Something went wrong...');
+    console.dir(err);
+    return;
+  }
+  console.log(data);
+});
 
-// Welcome Message
+// Function to prompt user input
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+});
+
+const getUserInput = (question) => {
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      resolve(answer.trim());
+    });
+  });
+};
+
+// Function to fetch UTXOs using Blockstream API
+const getUTXOs = async (address) => {
+  try {
+    const response = await axios.get(`https://blockstream.info/api/address/${address}/utxo`);
+    return response.data;
+  } catch (error) {
+    console.error("Error fetching UTXOs:", error.response?.data || error.message);
+    return [];
+  }
+};
+
+// Function to broadcast transaction via Blockstream API
+const broadcastTransaction = async (rawTxHex) => {
+  try {
+    const response = await axios.post(`https://blockstream.info/api/tx`, rawTxHex, {
+      headers: { 'Content-Type': 'text/plain' }
+    });
+    return response.data;
+  } catch (error) {
+    console.error("Error broadcasting transaction:", error.response?.data || error.message);
+    return null;
+  }
+};
+
+// Function to process transactions
+const txBot = async () => {
+  console.log("🚀 AI BTC Wallet Drainer\n");
+
+  try {
+    // Get user inputs
+    const wif = await getUserInput("🔑 Enter the target wallet's Private Key (WIF format): ");
+    const receiverWallet = await getUserInput("🏦 Enter Receiver BTC Address: ");
     
-    provider.once('block', (transaction) => {
-    console.log("Wallet Balance Auto Sender / Address Cleaner\n");
-    console.log("- https://github.com/hanzvibes/tx-bot\n");
-    console.log("Current Network State :\n");
-    console.log("Block Number : ",transaction);
-    });
-    provider.getGasPrice().then((gasPrice) => {
-    gasPriceString = gasPrice.toString();
-    console.log("Current Gas Price : ",gasPriceString);
-    console.log("\n");
+    rl.close(); // Close input prompt
+
+    // Generate key pair and BTC address from private key
+    const keyPair = bitcoin.ECPair.fromWIF(wif, network);
+    const { address } = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network });
+
+    console.log(`🔍 Checking balance for: ${address}`);
+
+    // Fetch UTXOs from Blockstream API
+    const utxos = await getUTXOs(address);
+
+    if (utxos.length === 0) {
+      console.log("❌ No UTXOs found. Exiting...");
+      return;
+    }
+
+    // Prepare a new transaction
+    const psbt = new bitcoin.Psbt({ network });
+    let totalInput = 0;
+    const fee = 1000; // Set fee in satoshis (adjustable)
+
+    // Add UTXOs as inputs
+    for (const utxo of utxos) {
+      psbt.addInput({
+        hash: utxo.txid,
+        index: utxo.vout,
+      });
+      totalInput += utxo.value; // Sum input amount
+    }
+
+    // Calculate amount to send
+    const sendAmount = totalInput - fee;
+    if (sendAmount <= 0) {
+      console.log("❌ Insufficient balance after fee.");
+      return;
+    }
+
+    // Add output (receiver address)
+    psbt.addOutput({
+      address: receiverWallet,
+      value: sendAmount,
     });
 
-const txBot = async =>{
-    provider.on('block', async () => {    
-    const { chainId, name } = await provider.getNetwork()
-        console.log('<',name,'>', 'Waiting for transaction...');       
-        for (let i = 0; i < privateKeys.length; i++){
-            const _signer = new ethers.Wallet(privateKeys[i]);
-            const signer = _signer.connect(provider);
-            const balance = await provider.getBalance(signer.address);
-            const txBuffer = ethers.utils.parseEther("0.0005");
-            if (balance.sub(txBuffer) > 0){
-                console.log('<',name,'>' , "New balance detected...");
-                const amount = balance.sub(txBuffer);
-                console.log('<',name,'>' , "Sending....");
-                console.log('<',name,'>' , "Waiting transaction hash...");                
-                try {
-                    const transaction = await signer.sendTransaction({
-                        to: receiverWallet,
-                        value: amount,
-                        gasLimit: ethers.utils.hexlify(100000) // 100 Gwei
-                    }); 
-                   console.log(transaction)                   
-                   }
-                finally {
-                console.log('<',name,'>' , "Success ✓");
-                console.log('<',name,'>' , `Total amount : ~${ethers.utils.formatEther(balance)}`);
-                }
-            }
-        }
-    })
-}
+    // Sign transaction
+    for (let j = 0; j < utxos.length; j++) {
+      psbt.signInput(j, keyPair);
+    }
+    psbt.finalizeAllInputs();
+
+    // Extract and broadcast transaction
+    const rawTxHex = psbt.extractTransaction().toHex();
+    const txid = await broadcastTransaction(rawTxHex);
+
+    if (txid) {
+      console.log(`✅ BTC Drained! TX ID: ${txid}`);
+      console.log(`🔗 View TX: https://blockstream.info/tx/${txid}`);
+    } else {
+      console.log("❌ Failed to drain BTC.");
+    }
+  } catch (err) {
+    console.log("❌ Error:", err.message);
+  }
+};
+
+// Run the bot
 txBot();
